@@ -9,7 +9,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config, Pool, Runtime};
 use regex::Regex;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, // <- add read + seek
@@ -176,7 +176,10 @@ async fn write_line_to_db(state: &AppState, line: &str) -> Result<(), anyhow::Er
     // Parse fourth field: public_ip
     let msg = &msg[space_idx + 1..];
     let space_idx = msg.find(' ').ok_or_else(|| anyhow::anyhow!("Missing public_ip"))?;
-    let public_ip = msg[..space_idx].to_string();
+    let public_ip_str = &msg[..space_idx];
+    let public_ip: IpAddr = public_ip_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid IP address '{}': {e}", public_ip_str))?;
     
     // Remaining message contains isn_info and status
     let msg = &msg[space_idx + 1..];
@@ -245,7 +248,7 @@ async fn write_line_to_db(state: &AppState, line: &str) -> Result<(), anyhow::Er
     info!("About to execute query with params: user_name='{}', public_ip='{}', status='{}', isn_info={:?}", 
           user_name, public_ip, status, isn_info);
 
-    // Use &String directly - tokio-postgres handles this correctly
+    // Use IpAddr for INET type - tokio-postgres handles this correctly
     client
         .execute(
             query,
