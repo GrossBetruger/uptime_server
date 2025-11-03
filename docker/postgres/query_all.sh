@@ -12,3 +12,4 @@ POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 echo "Querying database using docker exec..."
 docker exec -it "$CONTAINER_NAME" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT * FROM uptime_logs;"
 
+

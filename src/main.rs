@@ -6,6 +6,9 @@ use axum::{
     routing::get,
     Router,
 };
+use chrono::{DateTime, Utc};
+use deadpool_postgres::{Config, Pool, Runtime};
+use regex::Regex;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::{
     fs::{self, OpenOptions},
@@ -19,6 +22,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 #[derive(Clone)]
 struct AppState {
     logfile: Arc<Mutex<tokio::fs::File>>,
+    db_pool: Pool,
 }
 
 #[tokio::main]
@@ -43,8 +47,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     info!("Writing payloads to: {}", log_path.display());
 
+    // Initialize PostgreSQL connection pool
+    let db_host = std::env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let db_port = std::env::var("DB_PORT")
+        .unwrap_or_else(|_| "5432".to_string())
+        .parse::<u16>()
+        .map_err(|e| anyhow::anyhow!("Invalid DB_PORT: {e}"))?;
+    let db_user = std::env::var("DB_USER").unwrap_or_else(|_| "uptime_user".to_string());
+    let db_password = std::env::var("DB_PASSWORD").unwrap_or_else(|_| "uptime_password".to_string());
+    let db_name = std::env::var("DB_NAME").unwrap_or_else(|_| "uptime_db".to_string());
+
+    let mut config = Config::new();
+    config.host = Some(db_host);
+    config.port = Some(db_port);
+    config.user = Some(db_user);
+    config.password = Some(db_password);
+    config.dbname = Some(db_name.clone());
+
+    let db_pool = config
+        .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
+        .map_err(|e| anyhow::anyhow!("Failed to create database pool: {e}"))?;
+
+    // Test the connection
+    let _client = db_pool.get().await.map_err(|e| {
+        anyhow::anyhow!("Failed to get database connection: {e}")
+    })?;
+    info!("Connected to PostgreSQL database: {}", db_name);
+
     let state = AppState {
         logfile: Arc::new(Mutex::new(file)),
+        db_pool,
     };
 
     let app = Router::new()
@@ -78,8 +110,14 @@ async fn ingest(
     let single_line = payload.replace('\n', " ").replace('\r', "");
 
     if let Err(e) = write_line(&state, &single_line).await {
-        error!("failed to write payload: {e}");
+        error!("failed to write payload to file: {e}");
         return (StatusCode::INTERNAL_SERVER_ERROR, "failed to log payload").into_response();
+    }
+
+    // Write to PostgreSQL database
+    if let Err(e) = write_line_to_db(&state, &single_line).await {
+        error!("failed to write payload to database: {e}");
+        // Don't fail the request if DB write fails, just log the error
     }
 
     (StatusCode::OK, "logged").into_response()
@@ -90,6 +128,146 @@ async fn write_line(state: &AppState, line: &str) -> std::io::Result<()> {
     f.write_all(line.as_bytes()).await?;
     f.write_all(b"\n").await?;
     f.flush().await?;
+    Ok(())
+}
+
+/// Parse a line and write it to the PostgreSQL database.
+/// Expected format: "unix_timestamp iso_timestamp user_name public_ip isn_info status"
+/// Matches the Python reference parsing logic:
+/// - Extract first 4 fields: unix, iso, user, ip
+/// - Use regex to extract isn_info and status from remaining message
+async fn write_line_to_db(state: &AppState, line: &str) -> Result<(), anyhow::Error> {
+    let line = line.trim();
+    
+    if line.is_empty() {
+        return Err(anyhow::anyhow!("Empty line"));
+    }
+
+    // Debug: Print original input line
+    info!("Parsing line: '{}'", line);
+
+    // Parse first field: unix timestamp
+    let space_idx = line.find(' ').ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?;
+    let unix_timestamp_str = &line[..space_idx];
+    let unix_timestamp: i64 = unix_timestamp_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid unix timestamp: {e}"))?;
+    
+    // Parse second field: ISO timestamp
+    let msg = &line[space_idx + 1..];
+    let space_idx = msg.find(' ').ok_or_else(|| anyhow::anyhow!("Missing ISO timestamp"))?;
+    let iso_timestamp_str = &msg[..space_idx];
+    let iso_timestamp = DateTime::parse_from_rfc3339(iso_timestamp_str)
+        .or_else(|_| {
+            // Try without timezone
+            DateTime::parse_from_str(iso_timestamp_str, "%Y-%m-%dT%H:%M:%S")
+                .or_else(|_| {
+                    // Try with space separator
+                    DateTime::parse_from_str(iso_timestamp_str, "%Y-%m-%d %H:%M:%S")
+                })
+        })
+        .map_err(|e| anyhow::anyhow!("Invalid ISO timestamp format '{}': {e}", iso_timestamp_str))?;
+    
+    // Parse third field: user_name
+    let msg = &msg[space_idx + 1..];
+    let space_idx = msg.find(' ').ok_or_else(|| anyhow::anyhow!("Missing user_name"))?;
+    let user_name = msg[..space_idx].to_string();
+    
+    // Parse fourth field: public_ip
+    let msg = &msg[space_idx + 1..];
+    let space_idx = msg.find(' ').ok_or_else(|| anyhow::anyhow!("Missing public_ip"))?;
+    let public_ip = msg[..space_idx].to_string();
+    
+    // Remaining message contains isn_info and status
+    let msg = &msg[space_idx + 1..];
+    
+    // Use regex to extract isn_info and status: pattern (.+?) (online|offline)
+    // Matches Python: re.search("(.+?) (online|offline)", msg)
+    // Non-greedy match will capture everything before the first occurrence of " online" or " offline"
+    let re = Regex::new(r"(.+?)\s+(online|offline)")
+        .map_err(|e| anyhow::anyhow!("Failed to create regex: {e}"))?;
+    
+    let (isn_info, status) = if let Some(captures) = re.captures(msg) {
+        let isn_info_str = captures.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        let status_str = captures.get(2).map(|m| m.as_str()).unwrap_or("");
+        
+        (
+            if isn_info_str.is_empty() {
+                None
+            } else {
+                Some(isn_info_str.to_string())
+            },
+            status_str.to_string(),
+        )
+    } else {
+        return Err(anyhow::anyhow!("Could not parse status from message: '{}'", msg));
+    };
+
+    // Validate status
+    if status != "online" && status != "offline" {
+        return Err(anyhow::anyhow!("Invalid status: must be 'online' or 'offline', got '{}'", status));
+    }
+
+    // Validate user_name (cannot be empty for NOT NULL field)
+    if user_name.is_empty() {
+        return Err(anyhow::anyhow!("user_name cannot be empty"));
+    }
+
+    // Validate user_name length (VARCHAR(50) constraint)
+    if user_name.len() > 50 {
+        return Err(anyhow::anyhow!("user_name exceeds 50 characters: '{}'", user_name));
+    }
+
+    // Get database connection
+    let client = state.db_pool.get().await?;
+
+    // Insert into database
+    let query = r#"
+        INSERT INTO uptime_logs (unix_timestamp, iso_timestamp, user_name, public_ip, isn_info, status)
+        VALUES ($1, $2, $3, $4, $5, $6)
+    "#;
+
+    // Convert DateTime<FixedOffset> to DateTime<Utc> for PostgreSQL compatibility
+    let iso_timestamp_utc: DateTime<Utc> = iso_timestamp.with_timezone(&Utc);
+
+    // Debug: Print parsed values before database insert
+    info!(
+        "Parsed values - unix: {}, iso: {:?}, user_name: '{}' (len: {}), public_ip: '{}', isn_info: {:?}, status: '{}'",
+        unix_timestamp,
+        iso_timestamp_utc,
+        user_name,
+        user_name.len(),
+        public_ip,
+        isn_info,
+        status
+    );
+
+    info!("About to execute query with params: user_name='{}', public_ip='{}', status='{}', isn_info={:?}", 
+          user_name, public_ip, status, isn_info);
+
+    // Use &String directly - tokio-postgres handles this correctly
+    client
+        .execute(
+            query,
+            &[
+                &unix_timestamp,
+                &iso_timestamp_utc,
+                &user_name,
+                &public_ip,
+                &isn_info.as_deref(),
+                &status,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            let error_msg = format!("{:?}", e);
+            error!("Database insert error details - full error: {}", error_msg);
+            if let Some(source) = e.into_source() {
+                error!("Error source: {:?}", source);
+            }
+            anyhow::anyhow!("Database insert failed: {}", error_msg)
+        })?;
+
     Ok(())
 }
 
