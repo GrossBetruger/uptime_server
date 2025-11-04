@@ -109,10 +109,10 @@ async fn ingest(
 
     let single_line = payload.replace('\n', " ").replace('\r', "");
 
-    if let Err(e) = write_line(&state, &single_line).await {
-        error!("failed to write payload to file: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to log payload").into_response();
-    }
+    // if let Err(e) = write_line(&state, &single_line).await {
+    //     error!("failed to write payload to file: {e}");
+    //     return (StatusCode::INTERNAL_SERVER_ERROR, "failed to log payload").into_response();
+    // }
 
     // Write to PostgreSQL database
     if let Err(e) = write_line_to_db(&state, &single_line).await {
