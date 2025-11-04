@@ -109,10 +109,10 @@ async fn ingest(
 
     let single_line = payload.replace('\n', " ").replace('\r', "");
 
-    if let Err(e) = write_line(&state, &single_line).await {
-        error!("failed to write payload to file: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to log payload").into_response();
-    }
+    // if let Err(e) = write_line(&state, &single_line).await {
+    //     error!("failed to write payload to file: {e}");
+    //     return (StatusCode::INTERNAL_SERVER_ERROR, "failed to log payload").into_response();
+    // }
 
     // Write to PostgreSQL database
     if let Err(e) = write_line_to_db(&state, &single_line).await {
@@ -144,7 +144,7 @@ async fn write_line_to_db(state: &AppState, line: &str) -> Result<(), anyhow::Er
     }
 
     // Debug: Print original input line
-    info!("Parsing line: '{}'", line);
+    // info!("Parsing line: '{}'", line);
 
     // Parse first field: unix timestamp
     let space_idx = line.find(' ').ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?;
@@ -233,20 +233,20 @@ async fn write_line_to_db(state: &AppState, line: &str) -> Result<(), anyhow::Er
     // Convert DateTime<FixedOffset> to DateTime<Utc> for PostgreSQL compatibility
     let iso_timestamp_utc: DateTime<Utc> = iso_timestamp.with_timezone(&Utc);
 
-    // Debug: Print parsed values before database insert
-    info!(
-        "Parsed values - unix: {}, iso: {:?}, user_name: '{}' (len: {}), public_ip: '{}', isn_info: {:?}, status: '{}'",
-        unix_timestamp,
-        iso_timestamp_utc,
-        user_name,
-        user_name.len(),
-        public_ip,
-        isn_info,
-        status
-    );
+    // // Debug: Print parsed values before database insert
+    // info!(
+    //     "Parsed values - unix: {}, iso: {:?}, user_name: '{}' (len: {}), public_ip: '{}', isn_info: {:?}, status: '{}'",
+    //     unix_timestamp,
+    //     iso_timestamp_utc,
+    //     user_name,
+    //     user_name.len(),
+    //     public_ip,
+    //     isn_info,
+    //     status
+    // );
 
-    info!("About to execute query with params: user_name='{}', public_ip='{}', status='{}', isn_info={:?}", 
-          user_name, public_ip, status, isn_info);
+    // info!("About to execute query with params: user_name='{}', public_ip='{}', status='{}', isn_info={:?}", 
+    //       user_name, public_ip, status, isn_info);
 
     // Use IpAddr for INET type - tokio-postgres handles this correctly
     client
