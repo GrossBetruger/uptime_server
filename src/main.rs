@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use deadpool_postgres::{Config, Pool, Runtime};
 use regex::Regex;
 use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc, sync::OnceLock};
@@ -19,14 +20,26 @@ use tokio::{
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
+#[derive(Parser, Debug)]
+#[command(name = "uptime_server")]
+#[command(about = "Uptime monitoring server")]
+struct Args {
+    /// Enable legacy file logging (default: true)
+    #[arg(long, default_value = "true", action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
+    legacy_log: bool,
+}
+
 #[derive(Clone)]
 struct AppState {
     logfile: Arc<Mutex<tokio::fs::File>>,
     db_pool: Pool,
+    legacy_log: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(env_filter).init();
@@ -83,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         logfile: Arc::new(Mutex::new(file)),
         db_pool,
+        legacy_log: args.legacy_log,
     };
 
     let app = Router::new()
@@ -115,10 +129,13 @@ async fn ingest(
 
     let single_line = payload.replace('\n', " ").replace('\r', "");
 
-    // if let Err(e) = write_line(&state, &single_line).await {
-    //     error!("failed to write payload to file: {e}");
-    //     return (StatusCode::INTERNAL_SERVER_ERROR, "failed to log payload").into_response();
-    // }
+    // Write to file if legacy_log is enabled
+    if state.legacy_log {
+        if let Err(e) = write_line(&state, &single_line).await {
+            error!("failed to write payload to file: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to log payload").into_response();
+        }
+    }
 
     // Write to PostgreSQL database
     if let Err(e) = write_line_to_db(&state, &single_line).await {
