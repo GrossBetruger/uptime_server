@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Configure pool limits to prevent too many open files
     config.pool = Some(deadpool_postgres::PoolConfig {
-        max_size: 10,
+        max_size: 20,
         ..Default::default()
     });
 
