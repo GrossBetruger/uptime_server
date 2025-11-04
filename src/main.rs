@@ -15,6 +15,7 @@ use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, // <- add read + seek
     net::TcpListener,
+    process::Command,
     sync::Mutex,
 };
 use tracing::{error, info};
@@ -103,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/ingest", get(ingest))
         .route("/logs", get(get_logs)) // <- expose log
+        .route("/backup", get(get_backup)) // <- backup route
         .with_state(state);
 
     let bind = std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
@@ -324,6 +326,124 @@ async fn get_logs(State(state): State<AppState>) -> Response {
 
     // String implements IntoResponse with text/plain; charset=utf-8
     String::from_utf8_lossy(&buf).into_owned().into_response()
+}
+
+// GET /backup -> execute backup script and return dump as raw text
+async fn get_backup() -> Response {
+    info!("Backup requested via /backup endpoint");
+
+    // Execute the backup script
+    let output = Command::new("bash")
+        .arg("backup_db.sh")
+        .output()
+        .await;
+
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            error!("Failed to execute backup script: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to execute backup script: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("Backup script failed: {stderr}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Backup script failed: {stderr}"),
+        )
+            .into_response();
+    }
+
+    // Parse the output to find the backup file path
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    info!("Backup script output: {stdout}");
+
+    // The script outputs "Backup file: $BACKUP_FILE" - extract the path
+    let backup_file = stdout
+        .lines()
+        .find_map(|line| {
+            if line.contains("Backup file:") {
+                line.split("Backup file:").nth(1).map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            // Fallback: try to find any line with "backups/" and ".sql"
+            stdout
+                .lines()
+                .find_map(|line| {
+                    if line.contains("backups/") && line.contains(".sql") {
+                        // Extract the file path from the line
+                        let start = line.find("backups/")?;
+                        let path_part = &line[start..];
+                        path_part.split_whitespace().next().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+        })
+        .or_else(|| {
+            // Final fallback: find the most recent backup file in backups directory
+            let backup_dir = PathBuf::from("backups");
+            if let Ok(entries) = std::fs::read_dir(&backup_dir) {
+                entries
+                    .filter_map(|entry| {
+                        entry.ok().and_then(|e| {
+                            let path = e.path();
+                            if path.is_file()
+                                && path.extension() == Some(std::ffi::OsStr::new("sql"))
+                            {
+                                e.metadata()
+                                    .ok()
+                                    .and_then(|m| m.modified().ok().map(|modified| (path, modified)))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .max_by_key(|(_, modified)| *modified)
+                    .map(|(path, _)| path.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        });
+
+    let backup_file = match backup_file {
+        Some(path) => PathBuf::from(path),
+        None => {
+            error!("Could not find backup file path in script output");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not determine backup file path from script output",
+            )
+                .into_response();
+        }
+    };
+
+    // Read the backup file
+    let content = match fs::read_to_string(&backup_file).await {
+        Ok(content) => content,
+        Err(e) => {
+            error!("Failed to read backup file {:?}: {e}", backup_file);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read backup file: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    info!("Successfully read backup file: {:?}", backup_file);
+    
+    // Return as raw text (String implements IntoResponse with text/plain; charset=utf-8)
+    content.into_response()
 }
 
 #[cfg(test)]
