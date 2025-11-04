@@ -9,7 +9,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config, Pool, Runtime};
 use regex::Regex;
-use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc, sync::OnceLock};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, // <- add read + seek
@@ -63,6 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.user = Some(db_user);
     config.password = Some(db_password);
     config.dbname = Some(db_name.clone());
+    
+    // Configure pool limits to prevent too many open files
+    config.pool = Some(deadpool_postgres::PoolConfig {
+        max_size: 10,
+        ..Default::default()
+    });
 
     let db_pool = config
         .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
@@ -187,8 +193,10 @@ async fn write_line_to_db(state: &AppState, line: &str) -> Result<(), anyhow::Er
     // Use regex to extract isn_info and status: pattern (.+?) (online|offline)
     // Matches Python: re.search("(.+?) (online|offline)", msg)
     // Non-greedy match will capture everything before the first occurrence of " online" or " offline"
-    let re = Regex::new(r"(.+?)\s+(online|offline)")
-        .map_err(|e| anyhow::anyhow!("Failed to create regex: {e}"))?;
+    static STATUS_REGEX: OnceLock<Regex> = OnceLock::new();
+    let re = STATUS_REGEX.get_or_init(|| {
+        Regex::new(r"(.+?)\s+(online|offline)").expect("Failed to compile regex")
+    });
     
     let (isn_info, status) = if let Some(captures) = re.captures(msg) {
         let isn_info_str = captures.get(1).map(|m| m.as_str()).unwrap_or("").trim();
