@@ -317,3 +317,55 @@ async fn get_logs(State(state): State<AppState>) -> Response {
     // String implements IntoResponse with text/plain; charset=utf-8
     String::from_utf8_lossy(&buf).into_owned().into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn test_backup_restore() {
+        // Check if backup file exists
+        let backup_file = Path::new("backups/test_backup.sql");
+        assert!(
+            backup_file.exists(),
+            "Backup file 'backups/test_backup.sql' not found. Make sure it exists before running tests."
+        );
+
+        // Run the restore script
+        let script_path = Path::new("test_restore_backup.sh");
+        assert!(
+            script_path.exists(),
+            "Restore script 'test_restore_backup.sh' not found."
+        );
+
+        let output = Command::new("bash")
+            .arg(script_path)
+            .env("CLEANUP_TEST_CONTAINER", "true")
+            .output()
+            .expect("Failed to execute restore script");
+
+        // Check if script ran successfully
+        assert!(
+            output.status.success(),
+            "Backup restore script failed with exit code: {}. Stderr: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify stdout contains success indicators
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Test completed successfully") || stdout.contains("✓ Test completed successfully"),
+            "Script did not report success. Output: {}",
+            stdout
+        );
+
+        // Verify that row count is mentioned (indicating data was restored)
+        assert!(
+            stdout.contains("Total rows restored") || stdout.contains("Row count:"),
+            "Script output does not indicate data was restored. Output: {}",
+            stdout
+        );
+    }
+}
