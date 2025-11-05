@@ -13,7 +13,7 @@ use regex::Regex;
 use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc, sync::OnceLock};
 use tokio::{
     fs::{self, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, // <- add read + seek
+    io::{AsyncReadExt, AsyncWriteExt}, // <- read + write
     net::TcpListener,
     process::Command,
     sync::Mutex,
@@ -33,6 +33,7 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     logfile: Arc<Mutex<tokio::fs::File>>,
+    log_path: PathBuf,
     db_pool: Pool,
     legacy_log: bool,
 }
@@ -96,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         logfile: Arc::new(Mutex::new(file)),
+        log_path: log_path.clone(),
         db_pool,
         legacy_log: args.legacy_log,
     };
@@ -311,12 +313,19 @@ async fn write_line_to_db(state: &AppState, line: &str) -> Result<(), anyhow::Er
 
 // GET /logs -> return entire log as text/plain
 async fn get_logs(State(state): State<AppState>) -> Response {
-    let mut f = state.logfile.lock().await;
-
-    if let Err(e) = f.seek(std::io::SeekFrom::Start(0)).await {
-        error!("seek failed: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to read log").into_response();
-    }
+    // Open a fresh file handle for reading to ensure we get the complete file
+    // This avoids any issues with file position in the shared write handle
+    let mut f = match OpenOptions::new()
+        .read(true)
+        .open(&state.log_path)
+        .await
+    {
+        Ok(file) => file,
+        Err(e) => {
+            error!("failed to open log file for reading: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to read log").into_response();
+        }
+    };
 
     let mut buf = Vec::new();
     if let Err(e) = f.read_to_end(&mut buf).await {
@@ -489,6 +498,7 @@ mod tests {
 
         Ok(AppState {
             logfile: Arc::new(Mutex::new(file)),
+            log_path: log_path.clone(),
             db_pool,
             legacy_log: false,
         })
