@@ -159,9 +159,9 @@ async fn ingest(
 fn find_malformed(s: &str) -> bool {
     static MALFORMED_REGEX: OnceLock<Regex> = OnceLock::new();
     let re = MALFORMED_REGEX.get_or_init(|| {
-        Regex::new(r"(offline|online)\d{10,}").expect("Failed to compile malformed regex")
+        Regex::new(r"(offline|online)\d{10,}\s+").expect("Failed to compile malformed regex")
     });
-    re.is_match(s)
+    re.is_match(s)  
 }
 
 async fn write_line(state: &AppState, line: &str) -> std::io::Result<()> {
@@ -757,6 +757,86 @@ mod tests {
         let line = "1728145200 2024-10-05T14:20:00+00:00 user 192.168.1.1 online";
         let result = write_line_to_db(&state, line).await;
         assert!(result.is_ok(), "Should handle minimal valid line: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_find_malformed_offline_followed_by_timestamp() {
+        // Test case from example: offline followed by 10+ digit timestamp
+        let line = "1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. offline1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. offline";
+        assert!(find_malformed(line), "Should detect malformed line with offline followed by timestamp");
+    }
+
+    #[test]
+    fn test_find_malformed_online_followed_by_timestamp() {
+        // Test case with online instead of offline
+        let line = "1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. online1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. online";
+        assert!(find_malformed(line), "Should detect malformed line with online followed by timestamp");
+    }
+
+    #[test]
+    fn test_find_malformed_second_example() {
+        // Second example from user
+        let line = "1762964239 2025-11-12T18:17:19+02:00 TomerB 77.137.77.169 Hot-Net internet services Ltd. offline1762964239 2025-11-12T18:17:19+02:00 TomerB 77.137.77.169 Hot-Net internet services Ltd. offline";
+        assert!(find_malformed(line), "Should detect malformed line from second example");
+    }
+
+    #[test]
+    fn test_find_malformed_valid_line() {
+        // Valid line should not be detected as malformed
+        let line = "1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. offline";
+        assert!(!find_malformed(line), "Should not detect valid line as malformed");
+    }
+
+    #[test]
+    fn test_find_malformed_offline_with_9_digits() {
+        // offline followed by only 9 digits should not match (requires 10+)
+        let line = "1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. offline123456789";
+        assert!(!find_malformed(line), "Should not detect offline followed by 9 digits as malformed");
+    }
+
+    #[test]
+    fn test_find_malformed_offline_with_10_digits() {
+        // offline followed by exactly 10 digits and whitespace should match
+        let line = "1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. offline1234567890 ";
+        assert!(find_malformed(line), "Should detect offline followed by 10 digits and whitespace as malformed");
+    }
+
+    #[tokio::test]
+    async fn test_ingest_malformed_line_returns_bad_request() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Test that malformed line returns 400 Bad Request
+        let malformed_line = "1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. offline1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. offline";
+        
+        let mut params = HashMap::new();
+        params.insert("data".to_string(), malformed_line.to_string());
+        
+        let response = ingest(
+            State(state),
+            Query(params),
+            Bytes::new(),
+        ).await;
+        
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "Should return 400 Bad Request for malformed line");
+    }
+
+    #[tokio::test]
+    async fn test_ingest_valid_line_returns_ok() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Test that valid line returns 200 OK
+        let valid_line = "1762954241 2025-11-12T15:30:41+02:00 NisimY 77.137.74.110 Hot-Net internet services Ltd. offline";
+        
+        let mut params = HashMap::new();
+        params.insert("data".to_string(), valid_line.to_string());
+        
+        let response = ingest(
+            State(state),
+            Query(params),
+            Bytes::new(),
+        ).await;
+        
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK for valid line");
     }
 
     #[tokio::test]
