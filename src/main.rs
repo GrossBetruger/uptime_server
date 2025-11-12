@@ -133,6 +133,11 @@ async fn ingest(
 
     let single_line = payload.replace('\n', " ").replace('\r', "");
 
+    // Check for malformed lines (offline/online followed by 10+ digits) and skip them
+    if find_malformed(&single_line) {
+        return (StatusCode::BAD_REQUEST, "malformed payload").into_response();
+    }
+
     // Write to file if legacy_log is enabled
     if state.legacy_log {
         if let Err(e) = write_line(&state, &single_line).await {
@@ -148,6 +153,15 @@ async fn ingest(
     }
 
     (StatusCode::OK, "logged").into_response()
+}
+
+/// Check if a string contains malformed pattern: "offline" or "online" followed by 10+ digits
+fn find_malformed(s: &str) -> bool {
+    static MALFORMED_REGEX: OnceLock<Regex> = OnceLock::new();
+    let re = MALFORMED_REGEX.get_or_init(|| {
+        Regex::new(r"(offline|online)\d{10,}").expect("Failed to compile malformed regex")
+    });
+    re.is_match(s)
 }
 
 async fn write_line(state: &AppState, line: &str) -> std::io::Result<()> {
