@@ -325,8 +325,11 @@ async fn write_line_to_db(state: &AppState, line: &str) -> Result<(), anyhow::Er
     Ok(())
 }
 
-// GET /logs -> return entire log as text/plain
-async fn get_logs(State(state): State<AppState>) -> Response {
+// GET /logs -> return entire log as text/plain, or last n lines if ?n= is provided
+async fn get_logs(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     // Open a fresh file handle for reading to ensure we get the complete file
     // This avoids any issues with file position in the shared write handle
     let mut f = match OpenOptions::new()
@@ -347,8 +350,26 @@ async fn get_logs(State(state): State<AppState>) -> Response {
         return (StatusCode::INTERNAL_SERVER_ERROR, "failed to read log").into_response();
     }
 
+    let content = String::from_utf8_lossy(&buf).into_owned();
+    
+    // If n parameter is provided, return only the last n lines
+    if let Some(n_str) = params.get("n") {
+        match n_str.parse::<usize>() {
+            Ok(n) => {
+                let lines: Vec<&str> = content.lines().collect();
+                let total_lines = lines.len();
+                let start_idx = if n > total_lines { 0 } else { total_lines - n };
+                let last_n_lines = lines[start_idx..].join("\n");
+                return last_n_lines.into_response();
+            }
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "invalid value for parameter 'n': must be a positive integer").into_response();
+            }
+        }
+    }
+
     // String implements IntoResponse with text/plain; charset=utf-8
-    String::from_utf8_lossy(&buf).into_owned().into_response()
+    content.into_response()
 }
 
 // GET /backup -> execute backup script and return dump as raw text
@@ -883,5 +904,153 @@ mod tests {
             "Script output does not indicate data was restored. Output: {}",
             stdout
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_without_n_returns_all_lines() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Ensure parent directory exists
+        if let Some(parent) = state.log_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        
+        // Write test data to the log file
+        let test_lines = vec![
+            "line 1",
+            "line 2",
+            "line 3",
+            "line 4",
+            "line 5",
+        ];
+        let test_content = test_lines.join("\n");
+        tokio::fs::write(&state.log_path, test_content.as_bytes())
+            .await
+            .unwrap();
+        
+        // Call get_logs without n parameter
+        let params = HashMap::new();
+        let response = get_logs(State(state), Query(params)).await;
+        
+        // Check response status
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK");
+        
+        // Extract body from response
+        let (_parts, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        
+        // Should return all lines
+        assert_eq!(body_text, test_content, "Should return all log lines");
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_with_n_returns_last_n_lines() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Ensure parent directory exists
+        if let Some(parent) = state.log_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        
+        // Write test data to the log file
+        let test_lines = vec![
+            "line 1",
+            "line 2",
+            "line 3",
+            "line 4",
+            "line 5",
+        ];
+        let test_content = test_lines.join("\n");
+        tokio::fs::write(&state.log_path, test_content.as_bytes())
+            .await
+            .unwrap();
+        
+        // Call get_logs with n=3 parameter
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), "3".to_string());
+        let response = get_logs(State(state), Query(params)).await;
+        
+        // Check response status
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK");
+        
+        // Extract body from response
+        let (_parts, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        
+        // Should return last 3 lines
+        let expected = vec!["line 3", "line 4", "line 5"].join("\n");
+        assert_eq!(body_text, expected, "Should return last 3 lines");
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_with_n_greater_than_total_lines() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Ensure parent directory exists
+        if let Some(parent) = state.log_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        
+        // Write test data to the log file (only 3 lines)
+        let test_lines = vec![
+            "line 1",
+            "line 2",
+            "line 3",
+        ];
+        let test_content = test_lines.join("\n");
+        tokio::fs::write(&state.log_path, test_content.as_bytes())
+            .await
+            .unwrap();
+        
+        // Call get_logs with n=10 (greater than total lines)
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), "10".to_string());
+        let response = get_logs(State(state), Query(params)).await;
+        
+        // Check response status
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK");
+        
+        // Extract body from response
+        let (_parts, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        
+        // Should return all lines when n is greater than total
+        assert_eq!(body_text, test_content, "Should return all lines when n > total lines");
+    }
+
+    #[tokio::test]
+    async fn test_get_logs_with_invalid_n_returns_bad_request() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Ensure parent directory exists
+        if let Some(parent) = state.log_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        
+        // Write test data to the log file
+        let test_content = "line 1\nline 2\nline 3";
+        tokio::fs::write(&state.log_path, test_content.as_bytes())
+            .await
+            .unwrap();
+        
+        // Call get_logs with invalid n parameter (not a number)
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), "invalid".to_string());
+        let response = get_logs(State(state), Query(params)).await;
+        
+        // Should return 400 Bad Request
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "Should return 400 Bad Request for invalid n");
+        
+        // Extract body from response
+        let (_parts, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        
+        // Should contain error message
+        assert!(body_text.contains("invalid value for parameter 'n'"), 
+                "Should contain error message about invalid n parameter");
     }
 }
