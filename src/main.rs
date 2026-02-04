@@ -4,12 +4,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use deadpool_postgres::{Config, Pool, Runtime};
 use regex::Regex;
+use serde::Serialize;
 use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc, sync::OnceLock};
 use tokio::{
     fs::{self, OpenOptions},
@@ -37,6 +38,17 @@ struct AppState {
     log_path: PathBuf,
     db_pool: Pool,
     legacy_log: bool,
+}
+
+/// Response struct for /db-logs endpoint
+#[derive(Serialize)]
+struct LogEntry {
+    unix_timestamp: i64,
+    iso_timestamp: String,
+    user_name: String,
+    public_ip: String,
+    isn_info: Option<String>,
+    status: String,
 }
 
 #[tokio::main]
@@ -107,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/ingest", get(ingest))
         .route("/logs", get(get_logs)) // <- expose log
+        .route("/db-logs", get(get_db_logs)) // <- read logs from database
         .route("/backup", get(get_backup)) // <- backup route
         .with_state(state);
 
@@ -427,6 +440,133 @@ async fn read_last_n_lines(f: &mut tokio::fs::File, n: usize) -> std::io::Result
     let mut result_buf = Vec::new();
     f.read_to_end(&mut result_buf).await?;
     Ok(String::from_utf8_lossy(&result_buf).into_owned())
+}
+
+// GET /db-logs -> return logs from database, optionally filtered by days lookbehind
+// Query params:
+//   - days: number of days to look back (default: all records)
+//   - n: limit number of records (default: 10000)
+async fn get_db_logs(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    // Parse days parameter (optional lookbehind window)
+    let days_filter = if let Some(days_str) = params.get("days") {
+        match days_str.parse::<u32>() {
+            Ok(days) => Some(days),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid value for parameter 'days': must be a positive integer",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    // Parse n parameter (limit, optional - no limit if not provided)
+    let limit: Option<i64> = if let Some(n_str) = params.get("n") {
+        match n_str.parse::<i64>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid value for parameter 'n': must be a positive integer",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    // Get database connection
+    let client = match state.db_pool.get().await {
+        Ok(client) => client,
+        Err(e) => {
+            error!("failed to get database connection: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to connect to database")
+                .into_response();
+        }
+    };
+
+    // Build query based on whether days filter and limit are provided
+    let rows = match (days_filter, limit) {
+        (Some(days), Some(n)) => {
+            // Calculate cutoff time in UTC to ensure timezone-aware comparison
+            let cutoff_time = Utc::now() - chrono::Duration::days(days as i64);
+            let query = r#"
+                SELECT unix_timestamp, iso_timestamp, user_name, public_ip, isn_info, status
+                FROM uptime_logs
+                WHERE iso_timestamp >= $1
+                ORDER BY iso_timestamp ASC
+                LIMIT $2
+            "#;
+            client.query(query, &[&cutoff_time, &n]).await
+        }
+        (Some(days), None) => {
+            let cutoff_time = Utc::now() - chrono::Duration::days(days as i64);
+            let query = r#"
+                SELECT unix_timestamp, iso_timestamp, user_name, public_ip, isn_info, status
+                FROM uptime_logs
+                WHERE iso_timestamp >= $1
+                ORDER BY iso_timestamp ASC
+            "#;
+            client.query(query, &[&cutoff_time]).await
+        }
+        (None, Some(n)) => {
+            let query = r#"
+                SELECT unix_timestamp, iso_timestamp, user_name, public_ip, isn_info, status
+                FROM uptime_logs
+                ORDER BY iso_timestamp ASC
+                LIMIT $1
+            "#;
+            client.query(query, &[&n]).await
+        }
+        (None, None) => {
+            let query = r#"
+                SELECT unix_timestamp, iso_timestamp, user_name, public_ip, isn_info, status
+                FROM uptime_logs
+                ORDER BY iso_timestamp ASC
+            "#;
+            client.query(query, &[]).await
+        }
+    };
+
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("failed to query database: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to query database")
+                .into_response();
+        }
+    };
+
+    // Format output as JSON array
+    let entries: Vec<LogEntry> = rows
+        .iter()
+        .map(|row| {
+            let unix_timestamp: i64 = row.get("unix_timestamp");
+            let iso_timestamp: DateTime<Utc> = row.get("iso_timestamp");
+            let user_name: String = row.get("user_name");
+            let public_ip: IpAddr = row.get("public_ip");
+            let isn_info: Option<String> = row.get("isn_info");
+            let status: String = row.get("status");
+
+            LogEntry {
+                unix_timestamp,
+                iso_timestamp: iso_timestamp.to_rfc3339(),
+                user_name,
+                public_ip: public_ip.to_string(),
+                isn_info,
+                status,
+            }
+        })
+        .collect();
+
+    Json(entries).into_response()
 }
 
 // GET /backup -> execute backup script and return dump as raw text
@@ -1109,5 +1249,167 @@ mod tests {
         // Should contain error message
         assert!(body_text.contains("invalid value for parameter 'n'"), 
                 "Should contain error message about invalid n parameter");
+    }
+
+    // Tests for get_db_logs endpoint
+
+    #[tokio::test]
+    async fn test_get_db_logs_returns_ok() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Call get_db_logs without any parameters
+        let params = HashMap::new();
+        let response = get_db_logs(State(state), Query(params)).await;
+        
+        // Check response status - should be OK (even if no records)
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK");
+    }
+
+    #[tokio::test]
+    async fn test_get_db_logs_with_days_parameter() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Call get_db_logs with days=7 parameter
+        let mut params = HashMap::new();
+        params.insert("days".to_string(), "7".to_string());
+        let response = get_db_logs(State(state), Query(params)).await;
+        
+        // Check response status
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK with days parameter");
+    }
+
+    #[tokio::test]
+    async fn test_get_db_logs_with_n_parameter() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Call get_db_logs with n=10 parameter
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), "10".to_string());
+        let response = get_db_logs(State(state), Query(params)).await;
+        
+        // Check response status
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK with n parameter");
+    }
+
+    #[tokio::test]
+    async fn test_get_db_logs_with_days_and_n_parameters() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Call get_db_logs with both days and n parameters
+        let mut params = HashMap::new();
+        params.insert("days".to_string(), "30".to_string());
+        params.insert("n".to_string(), "100".to_string());
+        let response = get_db_logs(State(state), Query(params)).await;
+        
+        // Check response status
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK with both parameters");
+    }
+
+    #[tokio::test]
+    async fn test_get_db_logs_with_invalid_days_returns_bad_request() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Call get_db_logs with invalid days parameter
+        let mut params = HashMap::new();
+        params.insert("days".to_string(), "invalid".to_string());
+        let response = get_db_logs(State(state), Query(params)).await;
+        
+        // Should return 400 Bad Request
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "Should return 400 Bad Request for invalid days");
+        
+        // Extract body from response
+        let (_parts, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        
+        // Should contain error message
+        assert!(body_text.contains("invalid value for parameter 'days'"), 
+                "Should contain error message about invalid days parameter");
+    }
+
+    #[tokio::test]
+    async fn test_get_db_logs_with_invalid_n_returns_bad_request() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Call get_db_logs with invalid n parameter
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), "not_a_number".to_string());
+        let response = get_db_logs(State(state), Query(params)).await;
+        
+        // Should return 400 Bad Request
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "Should return 400 Bad Request for invalid n");
+        
+        // Extract body from response
+        let (_parts, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        
+        // Should contain error message
+        assert!(body_text.contains("invalid value for parameter 'n'"), 
+                "Should contain error message about invalid n parameter");
+    }
+
+    #[tokio::test]
+    async fn test_get_db_logs_inserts_and_retrieves_record() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Insert a test record
+        let test_line = "1728145200 2024-10-05T14:20:00+00:00 dblogstest 192.168.1.100 test isn info online";
+        let insert_result = write_line_to_db(&state, test_line).await;
+        assert!(insert_result.is_ok(), "Should successfully insert test record: {:?}", insert_result.err());
+        
+        // Query the database to verify the record exists
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), "1".to_string());
+        let response = get_db_logs(State(state.clone()), Query(params)).await;
+        
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK");
+        
+        // Extract body from response
+        let (_parts, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        
+        // The response should contain data (at least one record)
+        assert!(!body_text.is_empty(), "Response should contain records");
+    }
+
+    #[tokio::test]
+    async fn test_get_db_logs_days_filter_excludes_old_records() {
+        let state = create_test_app_state().await.unwrap();
+        
+        // Insert a record with a timestamp from 10 days ago
+        let old_timestamp = Utc::now() - chrono::Duration::days(10);
+        let unix_ts = old_timestamp.timestamp();
+        let iso_ts = old_timestamp.to_rfc3339();
+        let old_line = format!("{} {} oldrecorduser 192.168.1.200 old isn info offline", unix_ts, iso_ts);
+        
+        let insert_result = write_line_to_db(&state, &old_line).await;
+        assert!(insert_result.is_ok(), "Should successfully insert old test record: {:?}", insert_result.err());
+        
+        // Insert a recent record (now)
+        let now = Utc::now();
+        let unix_ts_now = now.timestamp();
+        let iso_ts_now = now.to_rfc3339();
+        let new_line = format!("{} {} newrecorduser 192.168.1.201 new isn info online", unix_ts_now, iso_ts_now);
+        
+        let insert_result = write_line_to_db(&state, &new_line).await;
+        assert!(insert_result.is_ok(), "Should successfully insert new test record: {:?}", insert_result.err());
+        
+        // Query with days=5 - should exclude the 10-day-old record
+        let mut params = HashMap::new();
+        params.insert("days".to_string(), "5".to_string());
+        let response = get_db_logs(State(state), Query(params)).await;
+        
+        assert_eq!(response.status(), StatusCode::OK, "Should return 200 OK");
+        
+        // Extract body from response
+        let (_parts, body) = response.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        
+        // Should contain the new record but not the old one
+        assert!(body_text.contains("newrecorduser"), "Should contain the recent record");
+        assert!(!body_text.contains("oldrecorduser"), "Should NOT contain the old record (older than 5 days)");
     }
 }
