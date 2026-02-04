@@ -13,11 +13,12 @@ use regex::Regex;
 use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc, sync::OnceLock};
 use tokio::{
     fs::{self, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt}, // <- read + write
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, // <- read + write + seek
     net::TcpListener,
     process::Command,
     sync::Mutex,
 };
+use std::io::SeekFrom;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -344,32 +345,88 @@ async fn get_logs(
         }
     };
 
-    let mut buf = Vec::new();
-    if let Err(e) = f.read_to_end(&mut buf).await {
-        error!("read failed: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to read log").into_response();
-    }
-
-    let content = String::from_utf8_lossy(&buf).into_owned();
-    
-    // If n parameter is provided, return only the last n lines
-    if let Some(n_str) = params.get("n") {
+    // Determine number of lines to read. Default to 10000 if not specified to prevent OOM.
+    let n = if let Some(n_str) = params.get("n") {
         match n_str.parse::<usize>() {
-            Ok(n) => {
-                let lines: Vec<&str> = content.lines().collect();
-                let total_lines = lines.len();
-                let start_idx = if n > total_lines { 0 } else { total_lines - n };
-                let last_n_lines = lines[start_idx..].join("\n");
-                return last_n_lines.into_response();
-            }
+            Ok(n) => n,
             Err(_) => {
                 return (StatusCode::BAD_REQUEST, "invalid value for parameter 'n': must be a positive integer").into_response();
             }
         }
+    } else {
+        10000
+    };
+
+    match read_last_n_lines(&mut f, n).await {
+        Ok(content) => content.into_response(),
+        Err(e) => {
+            error!("failed to read log lines: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to read log").into_response()
+        }
+    }
+}
+
+/// Efficiently read the last n lines from a file by seeking backwards
+async fn read_last_n_lines(f: &mut tokio::fs::File, n: usize) -> std::io::Result<String> {
+    if n == 0 {
+        return Ok(String::new());
     }
 
-    // String implements IntoResponse with text/plain; charset=utf-8
-    content.into_response()
+    let len = f.metadata().await?.len();
+    if len == 0 {
+        return Ok(String::new());
+    }
+
+    let chunk_size = 64 * 1024; // 64KB chunks
+    let mut position = len;
+    let mut lines_found = 0;
+    
+    // Check if the file ends with a newline and ignore it for the line count
+    // (a trailing newline just terminates the last line, it doesn't start a new empty one)
+    let mut ignore_last_newline = false;
+    if len > 0 {
+        f.seek(SeekFrom::End(-1)).await?;
+        let mut buf = [0u8; 1];
+        f.read_exact(&mut buf).await?;
+        if buf[0] == b'\n' {
+            ignore_last_newline = true;
+        }
+    }
+
+    while position > 0 {
+        let to_read = std::cmp::min(position, chunk_size);
+        position -= to_read;
+        
+        f.seek(SeekFrom::Start(position)).await?;
+        let mut buf = vec![0u8; to_read as usize];
+        f.read_exact(&mut buf).await?;
+        
+        for (i, &byte) in buf.iter().enumerate().rev() {
+            let abs_pos = position + i as u64;
+            
+            if byte == b'\n' {
+                if ignore_last_newline && abs_pos == len - 1 {
+                    continue;
+                }
+                
+                lines_found += 1;
+                if lines_found == n {
+                    // Found the start of the Nth line (it starts after this newline)
+                    let start_pos = abs_pos + 1;
+                    f.seek(SeekFrom::Start(start_pos)).await?;
+                    let mut result_buf = Vec::new();
+                    f.read_to_end(&mut result_buf).await?;
+                    return Ok(String::from_utf8_lossy(&result_buf).into_owned());
+                }
+            }
+        }
+    }
+
+    // If we reached the start of the file without finding N lines, read the whole file
+    f.seek(SeekFrom::Start(0)).await?;
+    let mut result_buf = Vec::new();
+    f.read_to_end(&mut result_buf).await?;
+    Ok(String::from_utf8_lossy(&result_buf).into_owned())
 }
 
 // GET /backup -> execute backup script and return dump as raw text
